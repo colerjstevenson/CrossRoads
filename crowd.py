@@ -9,11 +9,12 @@ generator's camera.
 import colorsys
 import math
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 ANIM_DIR = Path(__file__).resolve().parent / "Animations"
 FRAME_COUNT = 12
@@ -35,6 +36,10 @@ SKIN_TONES = [
 HAIR_COLORS = [
     (28, 22, 20), (60, 40, 25), (100, 65, 35), (150, 100, 50),
     (205, 165, 95), (145, 70, 35), (130, 130, 130), (225, 218, 200),
+]
+PANTS_COLORS = [
+    (45, 62, 92), (72, 101, 140), (52, 54, 58), (125, 126, 122),
+    (166, 145, 108), (105, 76, 57), (91, 96, 65),
 ]
 
 _ASSETS = None
@@ -118,12 +123,8 @@ def _clothing_color(rng):
 
 def random_look(rng):
     """Random layer colors: shirt, pants, skin tone, hair."""
-    shirt, shirt_hue = _clothing_color(rng)
-    while True:
-        pants, pants_hue = _clothing_color(rng)
-        d = abs(shirt_hue - pants_hue)
-        if min(d, 1 - d) > 0.08:
-            break
+    shirt, _ = _clothing_color(rng)
+    pants = _jitter(rng, rng.choice(PANTS_COLORS), 8)
     return {
         "legs": pants,
         "arms": shirt,
@@ -132,27 +133,46 @@ def random_look(rng):
     }
 
 
-def _build_frames(direction, colors, female, mirror):
-    """Recolor every layer and composite the 12 person frames."""
-    data = load_assets()[direction]
-    width, height = data["size"]
-    hair = "hair_female" if female else "hair_male"
-    order = [("legs", colors["legs"]), ("arms", colors["arms"]),
-             ("head", colors["head"]), (hair, colors["hair"])]
-    frames = []
-    for i in range(FRAME_COUNT):
+class _PersonFrames(Sequence):
+    def __init__(self, data, order, mirror):
+        self.data = data
+        self.order = order
+        self.mirror = mirror
+        self.cache = {}
+
+    def __len__(self):
+        return FRAME_COUNT
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        index = range(len(self))[index]
+        if index in self.cache:
+            return self.cache[index]
+        width, height = self.data["size"]
         comp = Image.new("RGBA", (width, height))
-        for layer, color in order:
-            norm, alpha = data["layers"][layer][i]
+        for layer, color in self.order:
+            norm, alpha = self.data["layers"][layer][index]
             rgb = np.clip(norm[..., None].astype(np.float32) * np.asarray(color, dtype=np.float32), 0, 255).astype(np.uint8)
             comp = Image.alpha_composite(comp, Image.fromarray(np.dstack([rgb, alpha])))
-        if mirror:
+        if self.mirror:
             comp = comp.transpose(Image.FLIP_LEFT_RIGHT)
-        frames.append(comp)
+        self.cache[index] = comp
+        return comp
+
+
+def _build_frames(direction, colors, female, mirror):
+    """Recolor and cache each person's sprites only when needed."""
+    data = load_assets()[direction]
+    width, _ = data["size"]
+    hair = "hair_female" if female else "hair_male"
+    order = tuple((layer, tuple(color)) for layer, color in (
+        ("legs", colors["legs"]), ("arms", colors["arms"]),
+        ("head", colors["head"]), (hair, colors["hair"])))
     ax, ay = data["anchor"]
     if mirror:
         ax = width - ax
-    return frames, (ax, ay)
+    return _PersonFrames(data, order, mirror), (ax, ay)
 
 
 @dataclass(frozen=True)
@@ -200,7 +220,7 @@ class Person:
     rate: float  # walk-cycle frames advanced per output frame
     phase: float  # walk-cycle start offset
     height: float  # world-unit height
-    frames: list  # 12 composited RGBA sprites
+    frames: Sequence  # 12 lazily composited RGBA sprites
     anchor: tuple  # (x, y) foot anchor in sprite pixels
     entry: float  # signed camera-horizontal extension at route.start
     exit: float  # signed camera-horizontal extension at route.end
@@ -340,21 +360,108 @@ def _project(img, cam, x, y, height):
     return feet[2], fx, fy, pixel_h
 
 
-def draw_frame(img, cam, people, t, dog=None):
+def _draw_shadow(mask, cam, sprite, anchor, sprite_height, x, y, height,
+                 depth_shift, style, seed, drawing):
+    """Project a contact blob or the sprite's alpha onto the ground."""
+    alpha = sprite.getchannel("A")
+    if style == "contact":
+        if not alpha.getbbox():
+            return
+        alpha = Image.new("L", (64, 64))
+        rng = random.Random(f"shadow:{seed}:{drawing}")
+        points = []
+        for i in range(24):
+            angle = 2 * math.pi * i / 24
+            radius = rng.uniform(0.94, 1.06)
+            points.append((32 + 11 * radius * math.cos(angle),
+                           32 + 28 * radius * math.sin(angle)))
+        ImageDraw.Draw(alpha).polygon(points, fill=255)
+        anchor, sprite_height = (32, 32), 64
+    direction = (math.sqrt(0.5), math.sqrt(0.5))
+    side = (-direction[1], direction[0])
+    # Keep increasing sprite x pointed toward camera-right.
+    if side[0] * cam.ca - side[1] * cam.sa < 0:
+        side = (-side[0], -side[1])
+    unit = height / sprite_height
+    length = 0.85 if style == "cast" else 0.24
+    ax, ay = anchor
+    origin = (x - side[0] * ax * unit + direction[0] * ay * unit * length,
+              y - side[1] * ax * unit + direction[1] * ay * unit * length)
+    base = np.array(cam.to_cam(*origin))
+    right = np.array(cam.to_cam(origin[0] + side[0] * unit,
+                                origin[1] + side[1] * unit)) - base
+    down = np.array(cam.to_cam(origin[0] - direction[0] * unit * length,
+                               origin[1] - direction[1] * unit * length)) - base
+    base[2] += depth_shift
+    camera_matrix = np.column_stack((right, down, base))
+    corners = [camera_matrix @ (u, v, 1) for u, v in
+               ((0, 0), (alpha.width, 0), (alpha.width, alpha.height), (0, alpha.height))]
+    clipped = []
+    for a, b in zip(corners, corners[1:] + corners[:1]):
+        if a[2] >= cam.near:
+            clipped.append(a)
+        if (a[2] >= cam.near) != (b[2] >= cam.near):
+            clipped.append(a + (b - a) * ((cam.near - a[2]) / (b[2] - a[2])))
+    if not clipped:
+        return
+    polygon = [cam.project(point) for point in clipped]
+    left = max(0, math.floor(min(point[0] for point in polygon)))
+    top = max(0, math.floor(min(point[1] for point in polygon)))
+    right_edge = min(mask.width, math.ceil(max(point[0] for point in polygon)))
+    bottom = min(mask.height, math.ceil(max(point[1] for point in polygon)))
+    if left >= right_edge or top >= bottom:
+        return
+
+    projection = np.array(((cam.focal, 0, cam.w / 2),
+                           (0, -cam.focal, cam.h / 2),
+                           (0, 0, 1))) @ camera_matrix
+    inverse = np.linalg.inv(projection) @ np.array(((1, 0, left), (0, 1, top), (0, 0, 1)))
+    inverse /= inverse[2, 2]
+    coefficients = tuple(inverse.flat[:8])
+    size = (right_edge - left, bottom - top)
+    shadow = alpha.transform(
+        size, Image.Transform.PERSPECTIVE, coefficients, resample=Image.Resampling.BICUBIC)
+    clip = Image.new("L", size)
+    ImageDraw.Draw(clip).polygon([(px - left, py - top) for px, py in polygon], fill=255)
+    opacity = random.Random(f"shadow:{seed}:{drawing}").uniform(0.32, 0.38)
+    shadow = ImageChops.multiply(shadow, clip).point(lambda value: round(value * opacity))
+    region = mask.crop((left, top, right_edge, bottom))
+    mask.paste(ImageChops.lighter(region, shadow), (left, top))
+
+
+def draw_frame(img, cam, people, t, dog=None, *, shadows=False,
+               shadow_style="contact", shadow_hold=1):
     """Composite the crowd (and optional dog) at frame t onto img (in place)."""
+    if shadow_style not in ("contact", "cast"):
+        raise ValueError("Shadow style must be 'contact' or 'cast'.")
     obstacle = dog.obstacle() if dog is not None else None
     visible = []
-    for person in people:
+    shadow_poses = []
+    for index, person in enumerate(people):
         x, y = person.ground_pose(t, obstacle)
         depth, fx, fy, pixel_h = _walker_projection(cam, x, y, person.height)
         sprite = person.frames[int(person.phase + person.rate * t) % FRAME_COUNT]
         visible.append((depth, sprite, person.anchor, fx, fy, pixel_h / sprite.height))
+        if shadows:
+            shadow_poses.append((sprite, person.anchor, sprite.height, x, y, person.height,
+                                 max(depth, cam.dist / 4) - depth, f"person:{index}"))
     if dog is not None:
         proj = _project(img, cam, dog.x, dog.y, dog.height)
         if proj is not None:
             depth, fx, fy, pixel_h = proj
             sprite, anchor = dog.sprite(cam, people, t)
             visible.append((depth, sprite, anchor, fx, fy, pixel_h / dog.WORK_HEIGHT))
+            if shadows:
+                shadow_poses.append((sprite, anchor, dog.WORK_HEIGHT, dog.x, dog.y,
+                                     dog.height, 0, "dog"))
+    if shadow_poses:
+        mask = Image.new("L", img.size)
+        drawing = t // max(1, shadow_hold)
+        for sprite, anchor, sprite_height, x, y, height, depth_shift, seed in shadow_poses:
+            _draw_shadow(mask, cam, sprite, anchor, sprite_height, x, y, height, depth_shift,
+                         shadow_style, seed, drawing)
+        color = (25, 25, 25, 255) if img.mode == "RGBA" else (25, 25, 25)
+        img.paste(color, mask=mask)
     visible.sort(key=lambda item: -item[0])  # far to near
     for _, sprite, anchor, fx, fy, scale in visible:
         box = _sprite_box(sprite, anchor, fx, fy, scale)
