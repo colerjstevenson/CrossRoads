@@ -5,6 +5,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -54,6 +55,65 @@ class BackgroundTests(unittest.TestCase):
                       for frame in (0, 1, 2, 3, 4)]
         self.assertEqual(colors, [(255, 0, 0), (255, 0, 0), (0, 0, 255),
                                   (0, 0, 255), (255, 0, 0)])
+
+    def test_static_background_holds_first_image_and_stripes(self):
+        for perspective in (False, True):
+            with self.subTest(perspective=perspective):
+                p = replace(self.params, width=64, height=64, stripe_wobble=1,
+                            background_perspective=perspective)
+                first = app.render(p, supersample=1, frame=0)
+                animated = app.render(p, supersample=1, frame=2)
+                self.assertNotEqual(first.tobytes(), animated.tobytes())
+                p.background_animated = False
+                p.stripes_animated = False
+                renderer = app.ShotRenderer(p, supersample=1)
+                for frame in (0, 1, 2, 4, 17):
+                    self.assertEqual(app.render(p, supersample=1, frame=frame).tobytes(),
+                                     first.tobytes())
+                    self.assertEqual(renderer.frame(frame).tobytes(), first.tobytes())
+
+    def test_stripes_and_background_animate_independently(self):
+        for perspective in (False, True):
+            with self.subTest(perspective=perspective):
+                p = replace(self.params, width=64, height=64, stripe_wobble=1,
+                            background_perspective=perspective)
+                stripes_only = replace(p, background_animated=False)
+                renderer = app.ShotRenderer(stripes_only, supersample=1)
+                first = renderer.frame(0)
+                later = renderer.frame(2)
+                self.assertNotEqual(first.tobytes(), later.tobytes())
+                with patch.object(app, "_stripe_runs", return_value=[]):
+                    self.assertEqual(app.render(stripes_only, supersample=1, frame=0).tobytes(),
+                                     app.render(stripes_only, supersample=1, frame=2).tobytes())
+
+                road_only = replace(p, stripes_animated=False)
+                renderer = app.ShotRenderer(road_only, supersample=1)
+                first = renderer.frame(0)
+                later = renderer.frame(2)
+                self.assertNotEqual(first.tobytes(), later.tobytes())
+                first_stripes = [pixel == (255, 255, 255) for pixel in first.getdata()]
+                later_stripes = [pixel == (255, 255, 255) for pixel in later.getdata()]
+                self.assertTrue(any(first_stripes))
+                self.assertEqual(first_stripes, later_stripes)
+                self.assertEqual(later.tobytes(), app.render(road_only, supersample=1, frame=2).tobytes())
+
+    def test_texture_motion_can_be_disabled_independently(self):
+        path = self.directory / "pattern.png"
+        image = Image.new("RGB", (40, 40))
+        image.putdata([(x * 6, y * 6, (x + y) * 3)
+                       for y in range(40) for x in range(40)])
+        image.save(path)
+        p = replace(self.params, width=64, height=64, stripe_wobble=1,
+                    background_images=(str(path),), stripes_animated=False)
+        for perspective in (False, True):
+            p.background_perspective = perspective
+            with self.subTest(perspective=perspective), \
+                 patch.object(app, "_stripe_runs", return_value=[]):
+                first = app.render(p, supersample=1, frame=0)
+                self.assertNotEqual(first.tobytes(), app.render(p, supersample=1, frame=2).tobytes())
+                p.background_animated = False
+                self.assertEqual(first.tobytes(), app.render(p, supersample=1, frame=2).tobytes())
+                p.background_animated = True
 
     def test_tiled_background_uses_selected_image(self):
         self.params.background_zoom = 0.5
@@ -144,6 +204,9 @@ class BackgroundTests(unittest.TestCase):
             screen_x = (np.arange(width, dtype=np.float64) + 0.5 - width / 2) / cam.focal
             tilt = math.radians(p.tilt)
             sin_t, cos_t = math.sin(tilt), math.cos(tilt)
+            shift_up = p.zoom * p.camera_shift / 100
+            camera_y = -cam.dist * sin_t + shift_up * cos_t
+            camera_z = cam.dist * cos_t + shift_up * sin_t
             scale = texture.width / (p.zoom * zoom)
             angle = math.radians((drawing * app.BACKGROUND_TURN_DEG) % 360) if p.stripe_wobble else 0
             ca, sa = math.cos(angle), math.sin(angle)
@@ -153,10 +216,10 @@ class BackgroundTests(unittest.TestCase):
             for row in range(height):
                 v = (cam.h / 2 - row - 0.5) / cam.focal
                 denominator = cos_t - v * sin_t
-                ray = cam.dist * cos_t / denominator if denominator > 1e-9 else cam.dist * 60
+                ray = camera_z / denominator if denominator > 1e-9 else cam.dist * 60
                 ray = min(ray, cam.dist * 60)
                 sx = ray * screen_x
-                sy = -cam.dist * sin_t + ray * (v * cos_t + sin_t)
+                sy = camera_y + ray * (v * cos_t + sin_t)
                 wx, wy = sx * cam.ca + sy * cam.sa, -sx * cam.sa + sy * cam.ca
                 tx = texture_width / 2 + scale * (ca * wx + sa * wy + dx)
                 ty = source_height / 2 - scale * (-sa * wx + ca * wy + dy)
@@ -170,10 +233,13 @@ class BackgroundTests(unittest.TestCase):
             return output.tobytes()
 
         for width, height in ((37, 23), (17, 49)):
-            for tilt, angle, wobble, zoom in ((0, 0, 0, 1), (45, 37, .35, .2), (70, 180, 1, 2)):
+            for tilt, angle, wobble, zoom, shift in (
+                    (0, 0, 0, 1, 0), (45, 37, .35, .2, 0), (70, 180, 1, 2, 0),
+                    (45, 37, .35, .2, 25), (70, 180, 0, 2, -75)):
                 for drawing in (0, 1, 17):
-                    with self.subTest(size=(width, height), tilt=tilt, drawing=drawing):
-                        p = app.Params(tilt=tilt, angle=angle, stripe_wobble=wobble)
+                    with self.subTest(size=(width, height), tilt=tilt, drawing=drawing, shift=shift):
+                        p = app.Params(tilt=tilt, angle=angle, stripe_wobble=wobble,
+                                       camera_shift=shift)
                         cam = app.Camera(p, width, height)
                         actual = app._draw_perspective_road(
                             p, texture, texture.width, width, height, cam, drawing, zoom)
@@ -190,6 +256,15 @@ class BackgroundTests(unittest.TestCase):
             defaults.write_text("{}", encoding="utf-8")
             self.assertEqual(app.load_defaults().background_images, ())
             self.assertEqual(app.load_defaults().shadow_style, "cast")
+            self.assertTrue(app.load_defaults().background_animated)
+            app.save_defaults(replace(self.params, background_animated=False))
+            self.assertFalse(app.load_defaults().background_animated)
+            self.assertTrue(app.load_defaults().stripes_animated)
+            defaults.write_text('{"background_animated": false}', encoding="utf-8")
+            self.assertFalse(app.load_defaults().stripes_animated)
+            self.assertTrue(app.load_defaults().dog_blink)
+            app.save_defaults(replace(self.params, dog_blink=False))
+            self.assertFalse(app.load_defaults().dog_blink)
             defaults.write_text('{"shadows_enabled": false}', encoding="utf-8")
             self.assertFalse(app.load_defaults().shadows_enabled)
             self.assertEqual(app.load_defaults().shadow_style, "cast")
@@ -266,6 +341,31 @@ class BackgroundTests(unittest.TestCase):
                 ui.choose_backgrounds()
             error.assert_called_once()
             self.assertEqual(ui.p.background_images, self.paths)
+
+    def test_static_background_alone_is_not_animated(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        p = replace(self.params, stripe_wobble=1, background_animated=False,
+                    stripes_animated=False)
+        with patch.object(app, "load_defaults", return_value=p), \
+             patch.object(app, "_BackgroundWorker", _ThreadWorker):
+            ui = app.App(root)
+            self.addCleanup(self.cleanup_ui, ui)
+            with patch.object(app.messagebox, "showinfo") as info, \
+                 patch.object(app.filedialog, "asksaveasfilename") as dialog:
+                ui.save_animation()
+            info.assert_called_once()
+            dialog.assert_not_called()
+            for key in ("background_animated", "stripes_animated"):
+                with self.subTest(key=key), \
+                     patch.object(app.messagebox, "showinfo") as info, \
+                     patch.object(app.filedialog, "asksaveasfilename", return_value="") as dialog:
+                    ui.vars[key].set(True)
+                    ui.save_animation()
+                    info.assert_not_called()
+                    dialog.assert_called_once()
+                    ui.vars[key].set(False)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@
 Run:  python crosswalk_generator.py
 
 Stripe wobble controls both stripe jitter and the motion of the road
-texture. Both use the Dog tab's frame hold, even when the dog is hidden.
+texture. Each can be held on its first drawing independently.
+Both use the Dog tab's frame hold, even when the dog is hidden.
 The texture snaps to a new angle each drawing. Background zoom changes its
 scale without affecting the camera. Below 1.0, the road texture is tiled.
 Save PNG renders the displayed animation frame at the selected output size.
@@ -40,6 +41,7 @@ ROAD_TEXTURE = Path(__file__).with_name("BG.png")
 BACKGROUND_TILES = 5
 MIN_BACKGROUND_ZOOM = 1.0 / BACKGROUND_TILES
 MAX_BACKGROUND_ZOOM = 2.0
+MIN_PERSON_SIZE, MAX_PERSON_SIZE = 0.5, 4.0
 BACKGROUND_TURN_DEG = 110
 DEFAULTS_PATH = Path.home() / ".crossroads" / "defaults.json"
 _PREVIEW_RENDERER = None
@@ -121,6 +123,7 @@ class Params:
     # crowd
     crowd_enabled: bool = True
     crowd_count: int = 12
+    loop_pedestrians: bool = True
     person_size: float = 1.75  # world-unit height (stripe width is ~0.5)
     size_var: float = 0.12  # +/- fraction of person_size
     crowd_speed: float = 1.0
@@ -135,10 +138,40 @@ class Params:
     dog_clearance: float = 0.9  # radius people steer around
     dog_tilt: float = 12.0  # max lean in degrees when looking sideways
     dog_hold: int = 2  # output frames per dog drawing
+    dog_blink: bool = True
     stripe_wobble: float = 0.35  # fraction of the allowed redraw displacement
+    background_animated: bool = True
+    stripes_animated: bool = True
     background_zoom: float = 1.0  # relative to the single-image cover scale
     background_perspective: bool = True
     background_images: tuple[str, ...] = ()  # empty uses the built-in texture
+    custom_pedestrians: tuple[crowd.CustomPedestrian, ...] = ()
+    camera_shift: float = 0.0  # camera-local up, as a percentage of zoom
+
+
+def random_scene_params(params, rng=None):
+    rng = rng or random
+    p = replace(params)
+    p.mode = rng.choice(("single", "cross"))
+    p.angle = rng.uniform(0, 360)
+    p.zoom = rng.uniform(5, 16)
+    p.tilt = rng.uniform(20, 65)
+    p.depth = rng.uniform(1.5, 8)
+    p.road_color = rng.choice(
+        ("#55585c", "#66625a", "#757575", "#48535b", "#827f75"))
+    p.background_animated = rng.choice((True, False))
+    p.background_zoom = rng.uniform(max(MIN_BACKGROUND_ZOOM, 0.5), 1.6)
+    p.background_perspective = rng.choice((True, False))
+    p.crowd_enabled = rng.choice((True, True, False))
+    p.crowd_count = rng.randint(5, 24)
+    p.loop_pedestrians = rng.choice((True, True, False))
+    p.crowd_seed = rng.randrange(1_000_000)
+    p.shadows_enabled = rng.choice((True, True, False))
+    p.shadow_style = rng.choice(("contact", "cast"))
+    if not p.crowd_enabled and not p.dog_enabled and not any(
+            person.route for person in p.custom_pedestrians):
+        p.crowd_enabled = True
+    return p
 
 
 def load_defaults():
@@ -146,7 +179,83 @@ def load_defaults():
         return Params()
 
     values = json.loads(DEFAULTS_PATH.read_text(encoding="utf-8"))
-    return decode_params(values)
+    return replace(decode_params(values), custom_pedestrians=())
+
+
+def decode_pedestrians(raw):
+    if not isinstance(raw, list):
+        raise ValueError("Custom pedestrians must be a list.")
+    pedestrians = []
+    ids = set()
+    keys = set(crowd.CustomPedestrian.__dataclass_fields__)
+    for spec in raw:
+        if not isinstance(spec, dict) or (set(spec) | {
+                "height", "walk_duration", "pet_dog", "pet_seconds", "pet_offset",
+                "side_walk_folder", "side_walk_stride"}) != keys:
+            raise ValueError("Invalid custom pedestrian settings.")
+        side_folder = spec.get("side_walk_folder")
+        stride = spec.get("side_walk_stride", crowd.STRIDE_FACTOR)
+        if (side_folder is not None and
+                (not isinstance(side_folder, str) or not side_folder.strip() or "\0" in side_folder)):
+            raise ValueError("Invalid imported walk-cycle folder.")
+        if type(stride) not in (int, float) or not math.isfinite(stride) or stride <= 0:
+            raise ValueError("Imported walk-cycle stride must be positive and finite.")
+        pet_dog, pet_seconds = spec.get("pet_dog", False), spec.get("pet_seconds", 2.0)
+        pet_offset = spec.get("pet_offset", (0.0, 0.0))
+        if (type(pet_dog) is not bool or type(pet_seconds) not in (int, float)
+                or not math.isfinite(pet_seconds) or pet_seconds <= 0
+                or not isinstance(pet_offset, (list, tuple)) or len(pet_offset) != 2
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in pet_offset)):
+            raise ValueError("Invalid dog interaction duration or petting position.")
+        height = spec.get("height")
+        if height is not None and (type(height) not in (int, float)
+                                   or not MIN_PERSON_SIZE <= height <= MAX_PERSON_SIZE):
+            raise ValueError(f"Pedestrian size must be between {MIN_PERSON_SIZE:g} and {MAX_PERSON_SIZE:g}.")
+        duration = spec.get("walk_duration")
+        if duration is not None and (type(duration) is not int or duration < 2):
+            raise ValueError("A Walk block must be at least two frames long.")
+        pid, route, colors, female, speed, departure, clips = (
+            spec[k] for k in ("id", "route", "colors", "female", "speed", "departure", "clips"))
+        if (not isinstance(pid, str) or not pid or pid in ids
+                or type(female) is not bool
+                or type(speed) not in (int, float) or not 0.01 <= speed <= 100
+                or type(departure) is not int or departure < 0
+                or not isinstance(colors, (list, tuple)) or len(colors) != 4
+                or not all(isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c) for c in colors)):
+            raise ValueError("Invalid custom pedestrian identity, appearance, speed, or departure.")
+        if (not isinstance(route, (list, tuple)) or (len(route) == 1 and side_folder is None)
+                or any(not isinstance(point, (list, tuple)) or len(point) != 2
+                       or any(type(v) not in (int, float) or not math.isfinite(v) for v in point)
+                       for point in route)):
+            raise ValueError("A pedestrian route must be empty or contain at least two finite points; "
+                             "an imported character may have one placement point.")
+        route = tuple(tuple(point) for point in route)
+        distances = crowd.route_distances(route)
+        if not math.isfinite(distances[-1]) or any(b <= a for a, b in zip(distances, distances[1:])):
+            raise ValueError("Consecutive route points must be distinct and have a finite distance.")
+        blocks = []
+        if not isinstance(clips, (list, tuple)):
+            raise ValueError("Pedestrian clips must be a list.")
+        for clip in clips:
+            if not isinstance(clip, dict) or set(clip) != {"folder", "start", "end"}:
+                raise ValueError("Invalid pedestrian animation block.")
+            folder, start, end = clip["folder"], clip["start"], clip["end"]
+            if (not isinstance(folder, str) or not folder.strip() or "\0" in folder
+                    or type(start) is not int or type(end) is not int or not 0 <= start <= end):
+                raise ValueError("Invalid pedestrian animation folder or frame range.")
+            blocks.append(crowd.ClipBlock(folder, start, end))
+        blocks.sort(key=lambda block: block.start)
+        if any(a.end >= b.start for a, b in zip(blocks, blocks[1:])):
+            raise ValueError("Animation blocks on one pedestrian cannot overlap.")
+        if side_folder is not None and (blocks or pet_dog):
+            raise ValueError("Imported pedestrians cannot use layered clips or dog petting.")
+        ids.add(pid)
+        pedestrians.append(crowd.CustomPedestrian(pid, route, tuple(colors), female, speed,
+                                                  departure, tuple(blocks), height=height,
+                                                  walk_duration=duration, pet_dog=pet_dog,
+                                                  pet_seconds=pet_seconds, pet_offset=tuple(pet_offset),
+                                                  side_walk_folder=side_folder, side_walk_stride=stride))
+    return tuple(pedestrians)
 
 
 def decode_params(values):
@@ -167,6 +276,9 @@ def decode_params(values):
             valid = type(value) in (int, float) and math.isfinite(value)
             if valid:
                 value = float(value)
+        elif key == "custom_pedestrians":
+            settings[key] = decode_pedestrians(value)
+            continue
         elif isinstance(default, tuple):
             valid = isinstance(value, list) and all(
                 isinstance(path, str) and path for path in value)
@@ -186,13 +298,17 @@ def decode_params(values):
             except ValueError as e:
                 raise ValueError(f"Invalid color for saved setting: {key}") from e
         settings[key] = value
+    if "stripes_animated" not in settings and "background_animated" in settings:
+        settings["stripes_animated"] = settings["background_animated"]
     return replace(Params(), **settings)
 
 
 def save_defaults(params: Params):
     DEFAULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    values = asdict(params)
+    del values["custom_pedestrians"]
     DEFAULTS_PATH.write_text(
-        json.dumps(asdict(params), indent=2) + "\n", encoding="utf-8")
+        json.dumps(values, indent=2) + "\n", encoding="utf-8")
 
 
 @dataclass
@@ -217,7 +333,7 @@ class Project:
 
 def new_project(params):
     sequence = Sequence("Sequence1")
-    return Project(replace(params), [sequence], sequence.id)
+    return Project(replace(params, custom_pedestrians=()), [sequence], sequence.id)
 
 
 def validate_sequence_name(name):
@@ -237,13 +353,24 @@ def validate_sequence_name(name):
 def validate_project_params(p):
     if p.shadow_style not in ("contact", "cast"):
         raise ValueError("Shadow style must be 'contact' or 'cast'.")
+    for spec in p.custom_pedestrians:
+        if spec.side_walk_folder is not None:
+            if (not isinstance(spec.side_walk_folder, str) or not spec.side_walk_folder.strip()
+                    or "\0" in spec.side_walk_folder):
+                raise ValueError("Invalid imported walk-cycle folder.")
+            if spec.clips or spec.pet_dog:
+                raise ValueError("Imported pedestrians cannot use layered clips or dog petting.")
+        if (type(spec.side_walk_stride) not in (int, float)
+                or not math.isfinite(spec.side_walk_stride) or spec.side_walk_stride <= 0):
+            raise ValueError("Imported walk-cycle stride must be positive and finite.")
     ranges = {
         "width": (16, None), "height": (16, None), "angle": (0, 360),
         "zoom": (1, 20), "tilt": (0, 70), "stripe_count": (0, 40),
+        "camera_shift": (-75, 75),
         "stripe_width": (0.05, 3), "stripe_gap": (0.05, 3),
         "depth": (0.5, 15), "stripe_wobble": (0, 1),
         "background_zoom": (MIN_BACKGROUND_ZOOM, MAX_BACKGROUND_ZOOM),
-        "crowd_count": (0, 100), "person_size": (0.5, 4),
+        "crowd_count": (0, 100), "person_size": (MIN_PERSON_SIZE, MAX_PERSON_SIZE),
         "size_var": (0, 0.4), "crowd_speed": (0.25, 3),
         "crowd_seed": (0, None), "anim_fps": (1, None),
         "anim_cycles": (1, None), "dog_size": (0.2, 3),
@@ -254,6 +381,7 @@ def validate_project_params(p):
         if not math.isfinite(value) or value < low or (high is not None and value > high):
             raise ValueError(f"{key} must be at least {low}"
                              + (f" and at most {high}." if high is not None else "."))
+    interaction_for(p)
 
 
 def validate_backgrounds(params):
@@ -266,17 +394,22 @@ def validate_backgrounds(params):
 
 
 def project_values(project, directory):
+    def relative(path):
+        absolute = Path(path).resolve()
+        try:
+            return os.path.relpath(absolute, directory)
+        except ValueError:  # Paths on separate Windows drives cannot be relative.
+            return str(absolute)
+
     def settings(p):
         validate_project_params(p)
         values = asdict(p)
-        paths = []
-        for path in p.background_images:
-            absolute = Path(path).resolve()
-            try:
-                paths.append(os.path.relpath(absolute, directory))
-            except ValueError:  # Paths on separate Windows drives cannot be relative.
-                paths.append(str(absolute))
-        values["background_images"] = paths
+        values["background_images"] = [relative(path) for path in p.background_images]
+        for spec in values["custom_pedestrians"]:
+            for block in spec["clips"]:
+                block["folder"] = relative(block["folder"])
+            if spec["side_walk_folder"] is not None:
+                spec["side_walk_folder"] = relative(spec["side_walk_folder"])
         return values
 
     return {
@@ -317,12 +450,21 @@ def load_project_file(path):
     def settings(raw):
         keys = set(asdict(Params()))
         if (not isinstance(raw, dict) or set(raw) - keys
-                or keys - set(raw) - {"shadows_enabled", "shadow_style"}):
+                or keys - set(raw) - {"shadows_enabled", "shadow_style", "dog_blink",
+                                      "background_animated", "stripes_animated",
+                                      "custom_pedestrians", "camera_shift",
+                                      "loop_pedestrians"}):
             raise ValueError("Project setups must contain every scene setting.")
         p = decode_params(raw)
         validate_project_params(p)
         p.background_images = tuple(
             str((path.parent / image).resolve()) for image in p.background_images)
+        p.custom_pedestrians = tuple(
+            replace(spec, clips=tuple(replace(block, folder=str((path.parent / block.folder).resolve()))
+                                      for block in spec.clips),
+                    side_walk_folder=(str((path.parent / spec.side_walk_folder).resolve())
+                                      if spec.side_walk_folder is not None else None))
+            for spec in p.custom_pedestrians)
         return p
 
     ids = set()
@@ -365,7 +507,30 @@ def make_dog(p: Params):
     if not p.dog_enabled:
         return None
     return dog_mod.Dog(height=p.dog_size, clearance=p.dog_clearance,
-                       max_tilt=p.dog_tilt, hold=p.dog_hold)
+                       max_tilt=p.dog_tilt, hold=p.dog_hold,
+                       blink_enabled=p.dog_blink, fps=p.anim_fps)
+
+
+def interaction_for(p, *, validate=True):
+    specs = [spec for spec in p.custom_pedestrians if spec.pet_dog]
+    if not specs:
+        return None
+    if len(specs) > 1:
+        raise ValueError("Only one pedestrian can interact with the dog in a shot.")
+    spec = specs[0]
+    if (type(spec.pet_seconds) not in (int, float) or not math.isfinite(spec.pet_seconds)
+            or spec.pet_seconds <= 0 or not isinstance(spec.pet_offset, (tuple, list))
+            or len(spec.pet_offset) != 2
+            or any(type(v) not in (int, float) or not math.isfinite(v) for v in spec.pet_offset)):
+        raise ValueError("Invalid dog interaction duration or petting position.")
+    if len(spec.route) < 2 or (validate and not p.dog_enabled):
+        raise ValueError("Petting requires Show dog and a pedestrian route.")
+    interaction = crowd.DogInteraction(spec, spec.height or p.person_size, p.anim_fps,
+                                       Camera(p, p.width, p.height), p.dog_size)
+    if validate and any(block.start < interaction.return_start and block.end >= interaction.pet_start
+                        for block in spec.clips):
+        raise ValueError("An animation clip overlaps the reserved petting interval.")
+    return interaction
 
 
 # ---------------------------------------------------------------- camera
@@ -378,9 +543,11 @@ class Camera:
         half = math.tan(math.radians(HFOV_DEG) / 2)
         self.dist = (p.zoom / 2) / half
         self.focal = (width / 2) / half
-        self.pos = (0.0, -self.dist * math.sin(t), self.dist * math.cos(t))
         self.fwd = (0.0, math.sin(t), -math.cos(t))
         self.up = (0.0, math.cos(t), math.sin(t))
+        shift = p.zoom * p.camera_shift / 100
+        self.pos = (0.0, -self.dist * self.fwd[1] + shift * self.up[1],
+                    -self.dist * self.fwd[2] + shift * self.up[2])
         a = math.radians(p.angle)
         self.ca, self.sa = math.cos(a), math.sin(a)
         self.near = self.dist * 0.01
@@ -398,6 +565,18 @@ class Camera:
     def project(self, c):
         cx, cy, cz = c
         return (self.w / 2 + self.focal * cx / cz, self.h / 2 - self.focal * cy / cz)
+
+    def ground_point(self, sx, sy):
+        u = (sx - self.w / 2) / self.focal
+        v = (self.h / 2 - sy) / self.focal
+        dy, dz = self.fwd[1] + v * self.up[1], self.fwd[2] + v * self.up[2]
+        if dz >= -1e-9:
+            return None
+        depth = -self.pos[2] / dz
+        if depth <= self.near:
+            return None
+        rx, ry = depth * u, self.pos[1] + depth * dy
+        return rx * self.ca + ry * self.sa, -rx * self.sa + ry * self.ca
 
     def ground_radius(self):
         """Radius around the origin that covers everything visible on the ground."""
@@ -472,9 +651,13 @@ def _stripe_drawing(p: Params, frame: int) -> int:
     return frame // max(1, p.dog_hold) if p.stripe_wobble > 0 else 0
 
 
-def _background_key(p: Params, frame: int) -> tuple[int, int]:
-    image = (frame // max(1, p.dog_hold)) % max(1, len(p.background_images))
-    return _stripe_drawing(p, frame), image
+def _background_key(p: Params, frame: int) -> tuple[int, int, int]:
+    drawing = _stripe_drawing(p, frame)
+    stripe_drawing = drawing if p.stripes_animated else 0
+    road_drawing = drawing if p.background_animated else 0
+    image = ((frame // max(1, p.dog_hold)) % max(1, len(p.background_images))
+             if p.background_animated else 0)
+    return stripe_drawing, road_drawing, image
 
 
 def _sketch_stripe(p: Params, along_x: bool, start: float, end: float,
@@ -579,8 +762,6 @@ def _draw_perspective_road(p: Params, texture: Image.Image, source_width: int,
     source_height, texture_width = source.shape[:2]
     output = np.empty((height, width, 3), dtype=np.uint8)
     screen_x = (np.arange(width, dtype=np.float64) + 0.5 - width / 2) / cam.focal
-    tilt = math.radians(p.tilt)
-    sin_t, cos_t = math.sin(tilt), math.cos(tilt)
     scale = source_width / (p.zoom * zoom)
     wobble = min(1.0, max(0.0, p.stripe_wobble))
     angle = math.radians((drawing * BACKGROUND_TURN_DEG) % 360) if wobble else 0.0
@@ -592,13 +773,13 @@ def _draw_perspective_road(p: Params, texture: Image.Image, source_width: int,
     for row in range(0, height, 4):
         stop = min(row + 4, height)
         v = (cam.h / 2 - np.arange(row, stop)[:, None] - 0.5) / cam.focal
-        denominator = cos_t - v * sin_t
+        denominator = -cam.fwd[2] - v * cam.up[2]
         ray_scale = np.full_like(denominator, cam.dist * 60)
-        np.divide(cam.dist * cos_t, denominator, out=ray_scale,
+        np.divide(cam.pos[2], denominator, out=ray_scale,
                   where=denominator > 1e-9)
         ray_scale = np.minimum(ray_scale, cam.dist * 60)
         scene_x = ray_scale * screen_x
-        scene_y = -cam.dist * sin_t + ray_scale * (v * cos_t + sin_t)
+        scene_y = cam.pos[1] + ray_scale * (v * cam.up[1] + cam.fwd[1])
         world_x = scene_x * cam.ca + scene_y * cam.sa
         world_y = -scene_x * cam.sa + scene_y * cam.ca
         texture_x = texture_width / 2 + scale * (
@@ -688,9 +869,9 @@ def render(p: Params, width=None, height=None, supersample=3, *, frame: int = 0)
     height = height or p.height
     sw, shh = width * supersample, height * supersample
     cam = Camera(p, sw, shh)
-    drawing, image_index = _background_key(p, frame)
+    stripe_drawing, road_drawing, image_index = _background_key(p, frame)
     image_path = p.background_images[image_index] if p.background_images else str(ROAD_TEXTURE)
-    img = _draw_road(p, sw, shh, drawing, image_path, cam)
+    img = _draw_road(p, sw, shh, road_drawing, image_path, cam)
     draw = ImageDraw.Draw(img)
     road = ImageColor.getcolor(p.road_color, "RGB")
     graphite = 28 if sum(road) >= 180 else 143
@@ -711,7 +892,7 @@ def render(p: Params, width=None, height=None, supersample=3, *, frame: int = 0)
         if (max(xs) < -stroke_width or min(xs) > sw + stroke_width or
                 max(ys) < -stroke_width or min(ys) > shh + stroke_width):
             continue
-        polygon, strokes = _sketch_stripe(p, along_x, start, end, unit, drawing)
+        polygon, strokes = _sketch_stripe(p, along_x, start, end, unit, stripe_drawing)
         for points, light in strokes:
             _draw_stroke(draw, cam, points, along_x, pencil[light],
                          max(1, stroke_width // 2) if light else stroke_width)
@@ -724,7 +905,7 @@ def render(p: Params, width=None, height=None, supersample=3, *, frame: int = 0)
 
 
 class ShotRenderer:
-    def __init__(self, params, width=None, height=None, supersample=3):
+    def __init__(self, params, width=None, height=None, supersample=3, *, editor=False):
         self.p = replace(params)
         self.width = width or params.width
         self.height = height or params.height
@@ -734,6 +915,14 @@ class ShotRenderer:
         self.people = (crowd.make_crowd(self.p, walk_routes(self.p), self.cam,
                                        self.dog.obstacle() if self.dog else None)
                        if self.p.crowd_enabled and self.p.crowd_count > 0 else [])
+        self.custom = [crowd.CustomWalker(spec, spec.height or self.p.person_size, self.p.anim_fps)
+                       for spec in self.p.custom_pedestrians if spec.route]
+        self.interaction = interaction_for(self.p)
+        for walker in self.custom:
+            if self.interaction is not None and walker.spec.pet_dog:
+                walker.interaction = self.interaction
+                walker.pet_hold = self.p.dog_hold
+        self.editor = editor
         self.background = None
         self.background_key = None
 
@@ -743,10 +932,14 @@ class ShotRenderer:
             self.background = render(self.p, self.width, self.height,
                                      self.supersample, frame=number)
             self.background_key = key
-        image = self.background.copy()
+        return self.compose(self.background, number)
+
+    def compose(self, background, number):
+        image = background.copy()
         crowd.draw_frame(image, self.cam, self.people, number, self.dog,
                          shadows=self.p.shadows_enabled, shadow_style=self.p.shadow_style,
-                         shadow_hold=self.p.dog_hold)
+                         shadow_hold=self.p.dog_hold, custom=self.custom, allow_missing=self.editor,
+                         loop_pedestrians=self.p.loop_pedestrians)
         return image
 
     def __iter__(self):
@@ -764,6 +957,7 @@ def sequence_outputs(sequence, directory):
     validate_backgrounds([shot.params for shot in sequence.shots])
     for shot in sequence.shots:
         validate_project_params(shot.params)
+        validate_animation_folders(shot.params)
     def frames():
         for index, shot in enumerate(sequence.shots, 1):
             for number, image in enumerate(ShotRenderer(shot.params), 1):
@@ -774,7 +968,7 @@ def sequence_outputs(sequence, directory):
 def _thumbnail_image(p):
     scale = min(160 / p.width, 90 / p.height)
     return ShotRenderer(p, max(1, round(p.width * scale)),
-                        max(1, round(p.height * scale)), supersample=2).frame(0)
+                        max(1, round(p.height * scale)), supersample=2, editor=True).frame(0)
 
 
 def _preview_images(p, width, height, frame):
@@ -782,9 +976,25 @@ def _preview_images(p, width, height, frame):
     renderer = _PREVIEW_RENDERER
     if (renderer is None or renderer.p != p
             or renderer.width != width or renderer.height != height):
-        renderer = _PREVIEW_RENDERER = ShotRenderer(p, width, height, supersample=2)
+        renderer = _PREVIEW_RENDERER = ShotRenderer(p, width, height, supersample=2, editor=True)
     image = renderer.frame(frame)
     return renderer.background, image
+
+
+def _pet_preview_images(p, width, height, frame):
+    background, image = _preview_images(p, width, height, frame)
+    cam = Camera(p, width, height)
+    spec = next(spec for spec in p.custom_pedestrians if spec.pet_dog)
+    person_height = spec.height or p.person_size
+    _, cx, cy, pixel_height = crowd._walker_projection(
+        cam, 0, 0, max(person_height, p.dog_size))
+    scale = max(1.0, min(4.0, width / (2.5 * pixel_height), height / (1.7 * pixel_height)))
+    crop_width, crop_height = width / scale, height / scale
+    left = max(0.0, min(width - crop_width, cx - crop_width / 2))
+    top = max(0.0, min(height - crop_height, cy - .4 * pixel_height - crop_height / 2))
+    image = image.resize((width, height), Image.LANCZOS,
+                         box=(left, top, left + crop_width, top + crop_height))
+    return background, image, scale
 
 
 def _clear_render_caches(cancelled, progress):
@@ -792,6 +1002,33 @@ def _clear_render_caches(cancelled, progress):
     _PREVIEW_RENDERER = None
     _road_texture.cache_clear()
     _tiled_road_texture.cache_clear()
+    crowd.load_clip.cache_clear()
+    crowd.load_side_walk.cache_clear()
+    crowd.load_petting.cache_clear()
+    dog_mod.load_interaction_assets.cache_clear()
+
+
+def animation_folders(p):
+    return dict.fromkeys(block.folder for spec in p.custom_pedestrians for block in spec.clips)
+
+
+def side_walk_folders(p):
+    return dict.fromkeys(spec.side_walk_folder for spec in p.custom_pedestrians
+                         if spec.side_walk_folder is not None)
+
+
+def validate_animation_folders(p):
+    if interaction_for(p) is not None:
+        crowd.load_petting()
+        dog_mod.load_interaction_assets()
+    for folder in animation_folders(p):
+        if not Path(folder).is_dir():
+            raise ValueError(f"Animation folder is missing. Relink it in Custom Pedestrians:\n{folder}")
+        crowd.load_clip(folder)
+    for folder in side_walk_folders(p):
+        if not Path(folder).is_dir():
+            raise ValueError(f"Walk-cycle folder is missing. Relink it in Custom Pedestrians:\n{folder}")
+        crowd.load_side_walk(folder)
 
 
 def _background_call(function, args, cancelled, progress):
@@ -825,6 +1062,7 @@ def _export_sequence(sequence, directory, cancelled, progress):
 def _export_animation(p, base, cancelled, progress):
     if cancelled.is_set():
         return "Cancelled"
+    validate_animation_folders(p)
     renderer = ShotRenderer(p)
     gif_scale = min(1.0, 640 / p.width)
     gif_size = (max(1, int(p.width * gif_scale)), max(1, int(p.height * gif_scale)))
@@ -842,7 +1080,7 @@ def _export_animation(p, base, cancelled, progress):
     if cancelled.is_set():
         return "Cancelled"
     progress((len(gif_frames), "Encoding GIF (cancellation waits for encoding)"))
-    loop = {} if renderer.people else {"loop": 0}
+    loop = {} if renderer.people or renderer.custom else {"loop": 0}
     gif_frames[0].save(
         base + ".gif", save_all=True, append_images=gif_frames[1:],
         duration=int(round(1000 / p.anim_fps)), **loop)
@@ -852,7 +1090,56 @@ def _export_animation(p, base, cancelled, progress):
 # -------------------------------------------------------------------- UI
 
 
+class ClipDialog(simpledialog.Dialog):
+    def __init__(self, parent, folders, block, last_frame, other_blocks):
+        self.folders = folders
+        self.block = block
+        self.last_frame = last_frame
+        self.other_blocks = other_blocks
+        super().__init__(parent, "Pedestrian animation block")
+
+    def body(self, master):
+        self.folder = tk.StringVar(value=self.block.folder)
+        self.start = tk.StringVar(value=str(self.block.start + 1))
+        self.end = tk.StringVar(value=str(self.block.end + 1))
+        ttk.Label(master, text="Layered PNG folder").grid(row=0, column=0, sticky="w")
+        choice = ttk.Combobox(master, textvariable=self.folder, values=self.folders, width=48)
+        choice.grid(row=1, column=0, sticky="ew")
+        ttk.Button(master, text="Browse...", command=self._browse).grid(row=1, column=1)
+        for row, label, var in ((2, "First frame", self.start), (3, "Last frame (inclusive)", self.end)):
+            ttk.Label(master, text=label).grid(row=row, column=0, sticky="w")
+            ttk.Entry(master, textvariable=var, width=8).grid(row=row, column=1)
+        return choice
+
+    def _browse(self):
+        folder = filedialog.askdirectory(parent=self)
+        if folder:
+            self.folder.set(folder)
+
+    def validate(self):
+        try:
+            try:
+                start, end = int(self.start.get()) - 1, int(self.end.get()) - 1
+            except ValueError as error:
+                raise ValueError("Enter whole frame numbers.") from error
+            if not 0 <= start <= end < self.last_frame:
+                raise ValueError(f"Use an inclusive frame range from 1 to {self.last_frame}.")
+            if any(start <= block.end and block.start <= end for block in self.other_blocks):
+                raise ValueError("Animation blocks on one pedestrian cannot overlap.")
+            if not self.folder.get().strip():
+                raise ValueError("Choose a layered PNG folder.")
+            folder = str(Path(self.folder.get()).resolve())
+            crowd.load_clip(folder)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Invalid animation block", str(error), parent=self)
+            return False
+        self.result = crowd.ClipBlock(folder, start, end)
+        return True
+
+
 class App:
+    TIMELINE_LEFT = 63
+    TIMELINE_LANES = {"walk": (24, 45), "clip": (50, 71)}
     PREVIEW_MAX = (900, 650)
 
     def __init__(self, root):
@@ -869,14 +1156,22 @@ class App:
             )
         self._job = None
         self._photo = None
-        self._people = None
-        self._people_key = None
         self._preview_bg = None
         self._preview_cam = None
+        self._preview_bounds = None
+        self._preview_scale = 1.0
         self._preview_background_key = None
         self._preview_frame = 0
         self._anim_t = 0
         self._anim_job = None
+        self._scrub_frame = 0
+        self._block_drag = None
+        self._timeline_scrubbing = False
+        self._timeline_notice = ""
+        self._pedestrian_id = None
+        self._route_draft = None
+        self._positioning_pet = False
+        self._pet_drag = None
         self.project = new_project(self.p)
         self.project_path = None
         self._saved_state = None
@@ -912,17 +1207,22 @@ class App:
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
         self.canvas.bind("<Configure>", lambda e: self.schedule())
+        self.canvas.bind("<Button-1>", self._place_route_point)
+        self.canvas.bind("<B1-Motion>", self._drag_pet_position)
+        self.canvas.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_pet_drag", None))
 
         self.vars = {}
 
-        nb = ttk.Notebook(ctrl)
+        nb = self.notebook = ttk.Notebook(ctrl)
         nb.grid(row=1, column=0, sticky="nsew")
         walk_tab = ttk.Frame(nb, padding=8)
         crowd_tab = ttk.Frame(nb, padding=8)
         dog_tab = ttk.Frame(nb, padding=8)
+        self.pedestrian_tab = ttk.Frame(nb, padding=8)
         nb.add(walk_tab, text="Crosswalk")
         nb.add(crowd_tab, text="Crowd")
         nb.add(dog_tab, text="Dog")
+        nb.add(self.pedestrian_tab, text="Custom Pedestrians")
         r = 0
 
         ttk.Label(walk_tab, text="Image size (px)", font=("", 9, "bold")).grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
@@ -947,6 +1247,7 @@ class App:
             ("angle", "Angle (°)", 0, 360, float),
             ("zoom", "Zoom out (visible width)", 1, 20, float),
             ("tilt", "Camera tilt (°)", 0, 70, float),
+            ("camera_shift", "Camera up/down (%)", -75, 75, float),
             ("stripe_count", "Stripe count (0 = full)", 0, 40, int),
             ("stripe_width", "Stripe width", 0.05, 3, float),
             ("stripe_gap", "Stripe gap", 0.05, 3, float),
@@ -956,6 +1257,22 @@ class App:
         ]
         for key, label, lo, hi, typ in sliders:
             r = self._slider(walk_tab, r, key, label, lo, hi, typ)
+
+        background_animated = tk.BooleanVar(value=self.p.background_animated)
+        self.vars["background_animated"] = background_animated
+        ttk.Checkbutton(
+            walk_tab, text="Animate background",
+            variable=background_animated, command=self.schedule,
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+
+        stripes_animated = tk.BooleanVar(value=self.p.stripes_animated)
+        self.vars["stripes_animated"] = stripes_animated
+        ttk.Checkbutton(
+            walk_tab, text="Animate stripes",
+            variable=stripes_animated, command=self.schedule,
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
 
         background_perspective = tk.BooleanVar(value=self.p.background_perspective)
         self.vars["background_perspective"] = background_perspective
@@ -984,9 +1301,16 @@ class App:
         self._animate_checkbox(walk_tab, r)
         self._build_crowd_tab(crowd_tab)
         self._build_dog_tab(dog_tab)
+        self._build_pedestrian_tab(self.pedestrian_tab)
+        nb.bind("<<NotebookTabChanged>>", self._pedestrian_tab_changed)
 
-        ttk.Button(ctrl, text="Set defaults", command=self.set_defaults).grid(
-            row=0, column=0, sticky="ew", pady=(0, 8))
+        scene_actions = ttk.Frame(ctrl)
+        scene_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(scene_actions, text="Set defaults", command=self.set_defaults).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(scene_actions, text="Generate random scene",
+                   command=self.generate_random_scene).pack(
+                       side="left", fill="x", expand=True, padx=(4, 0))
         ttk.Button(ctrl, text="Save PNG…", command=self.save).grid(row=2, column=0, sticky="ew", pady=(14, 0))
         ttk.Button(ctrl, text="Save Animation…", command=self.save_animation).grid(row=3, column=0, sticky="ew", pady=(4, 0))
         self.status = ttk.Label(ctrl, text="", foreground="#666", wraplength=260)
@@ -1115,15 +1439,22 @@ class App:
         elif kind == "preview":
             revision, params, width, height, frame, cw, ch = context
             if not cancelled and revision == self._preview_revision and not self._rendering:
-                bg, image = result
+                bg, image = result[:2]
+                self._preview_scale = result[2] if len(result) == 3 else 1.0
                 self._preview_bg = bg
                 self._preview_background_key = _background_key(params, frame)
                 self._preview_cam = Camera(params, width, height)
                 self._photo = ImageTk.PhotoImage(image, master=self.root)
                 self.canvas.delete("all")
-                self.canvas.create_image(cw // 2, ch // 2, image=self._photo)
+                item = self.canvas.create_image(cw // 2, ch // 2, image=self._photo)
+                self._preview_bounds = self.canvas.bbox(item)
                 self._preview_frame = frame
-                self.status.config(text=f"Preview {width}x{height}  (output {params.width}x{params.height})")
+                missing = any(not Path(folder).is_dir() for folder in
+                              (*animation_folders(params), *side_walk_folders(params)))
+                warning = "\nMissing animation folder: relink it in Custom Pedestrians." if missing else ""
+                zoom = f"  (pet positioning {self._preview_scale:.1f}x)" if self._positioning_pet else ""
+                self.status.config(text=f"Preview {width}x{height}  (output {params.width}x{params.height}){zoom}{warning}")
+                self._draw_route_overlay()
 
     def _work_failed(self, kind, context, error):
         if kind in ("load", "sequence", "animation"):
@@ -1191,6 +1522,10 @@ class App:
             messagebox.showerror("Could not save defaults", str(e), parent=self.root)
             return
         self.status.config(text="Current values saved as defaults.")
+
+    def generate_random_scene(self):
+        self._load_editor(random_scene_params(self.read_params()))
+        self.status.config(text="Generated a random scene.")
 
     @property
     def sequence(self):
@@ -1432,15 +1767,25 @@ class App:
             self.vars["animate_preview"].set(False)
             self._toggle_anim_preview_stop()
             self.p = replace(p)
-            self._people_key = None
             self._preview_bg = None
+            self._preview_cam = self._preview_bounds = None
+            self._preview_scale = 1.0
             self._preview_frame = 0
+            self._scrub_frame = 0
+            self._block_drag = None
+            self._timeline_scrubbing = False
+            self._timeline_notice = ""
+            self._pedestrian_id = None
+            self._route_draft = None
+            self._positioning_pet = False
+            self._pet_drag = None
             for key, variable in self.vars.items():
                 if key != "animate_preview":
                     variable.set(getattr(self.p, key))
             for key in ("road_color", "stripe_color"):
                 self._fix_btn_fg(getattr(self, f"{key}_btn"), getattr(self.p, key))
             self._update_background_label()
+            self._refresh_pedestrians()
         finally:
             self._loading = False
         self.schedule()
@@ -1738,6 +2083,731 @@ class App:
         self._update_background_label()
         self.schedule()
 
+    def _build_pedestrian_tab(self, tab):
+        tab.columnconfigure(0, weight=1)
+        self.pedestrian_list = tk.Listbox(tab, height=3, exportselection=False)
+        self.pedestrian_list.grid(row=0, column=0, sticky="ew")
+        self.pedestrian_list.bind("<<ListboxSelect>>", self._select_pedestrian)
+        self.pedestrian_hint = tk.StringVar()
+        self.pedestrian_buttons = []
+
+        def buttons(row, actions, *, selected=True):
+            bar = ttk.Frame(tab)
+            bar.grid(row=row, column=0, sticky="w")
+            created = []
+            for label, command in actions:
+                button = ttk.Button(bar, text=label, command=command)
+                button.pack(side="left", padx=(0, 3))
+                created.append(button)
+                if selected or label == "Remove":
+                    self.pedestrian_buttons.append(button)
+            return created
+
+        buttons(1, (("Add pedestrian", self._add_pedestrian),
+                    ("Add imported…", self._add_side_pedestrian), ("Remove", self._remove_pedestrian)),
+                selected=False)
+        look = ttk.Frame(tab)
+        look.grid(row=2, column=0, sticky="w", pady=4)
+        self.part_buttons = []
+        for i, label in enumerate(("Legs", "Arms", "Head", "Hair")):
+            button = tk.Button(look, width=5, text=label, command=lambda i=i: self._pick_part(i))
+            button.pack(side="left", padx=(0, 3))
+            self.part_buttons.append(button)
+            self.pedestrian_buttons.append(button)
+        self.hair_variant = tk.BooleanVar()
+        hair = ttk.Checkbutton(look, text="Female hair", variable=self.hair_variant,
+                               command=lambda: self._change_pedestrian(female=self.hair_variant.get()))
+        hair.pack(side="left")
+        self.pedestrian_buttons.append(hair)
+        self.builtin_look_buttons = [*self.part_buttons, hair]
+        self.side_buttons = buttons(3, (("Relink walk…", self._relink_side_walk),
+                                        ("Stride…", self._set_side_stride)))
+        self.speed_button, _, _ = buttons(
+            4, (("Speed…", self._set_pedestrian_speed), ("Size…", self._set_pedestrian_size),
+                ("Draw route / place", self._start_route)))
+        self.route_controls = ttk.Frame(tab)
+        self.route_controls.grid(row=5, column=0, sticky="w")
+        for label, command in (("Undo point", self._undo_route_point), ("Finish route", self._finish_route),
+                               ("Cancel", self._cancel_route)):
+            ttk.Button(self.route_controls, text=label, command=command).pack(side="left", padx=(0, 3))
+        ttk.Label(tab, textvariable=self.pedestrian_hint, wraplength=295).grid(row=6, column=0, sticky="w")
+
+        heading = ttk.Frame(tab)
+        heading.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        self.timeline_label = ttk.Label(heading)
+        self.timeline_label.pack(side="left")
+        ttk.Button(heading, text="Go to…", width=7, command=self._go_to_frame).pack(side="right")
+        self.timeline = tk.Canvas(tab, height=76, width=295, background="#262626", highlightthickness=0)
+        self.timeline.grid(row=8, column=0, sticky="ew")
+        self.timeline.bind("<Configure>", lambda _: self._draw_timeline())
+        self.timeline.bind("<Button-1>", self._timeline_press)
+        self.timeline.bind("<B1-Motion>", self._timeline_drag)
+        self.timeline.bind("<ButtonRelease-1>", self._timeline_release)
+        self.timeline.bind("<Motion>", self._timeline_hover)
+        self.timeline.bind("<Leave>", lambda _: self.timeline.configure(cursor=""))
+        self._animate_checkbox(tab, 9)
+        self.clip_list = tk.Listbox(tab, height=3, exportselection=False)
+        self.clip_list.grid(row=10, column=0, sticky="ew")
+        self.clip_buttons = buttons(11, (("Add clip…", self._add_clip), ("Edit / relink…", self._edit_clip),
+                                         ("Remove clip", self._remove_clip)))
+        self.vars["anim_cycles"].trace_add("write", self._refresh_timeline_settings)
+        self.vars["anim_fps"].trace_add("write", self._refresh_timeline_settings)
+        self.timeline_help = ttk.Label(tab, wraplength=295)
+        self.timeline_help.grid(row=12, column=0, sticky="w")
+        pet = ttk.LabelFrame(tab, text="Dog interaction", padding=4)
+        pet.grid(row=13, column=0, sticky="ew", pady=4)
+        self.pet_enabled_var = tk.BooleanVar()
+        ttk.Checkbutton(pet, text="Pet dog, then leave together", variable=self.pet_enabled_var,
+                        command=self._toggle_pet).grid(row=0, column=0, columnspan=4, sticky="w")
+        self.pet_duration_var = tk.StringVar(value="2")
+        ttk.Label(pet, text="Pet seconds:").grid(row=1, column=0)
+        duration = ttk.Entry(pet, textvariable=self.pet_duration_var, width=6)
+        duration.grid(row=1, column=1)
+        duration.bind("<Return>", self._set_pet_duration)
+        ttk.Button(pet, text="Apply", command=self._set_pet_duration).grid(row=1, column=2)
+        self.pet_position_button = ttk.Button(pet, text="Position petting pose",
+                                              command=self._position_pet)
+        self.pet_position_button.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(pet, text="Fit sequence", command=self._fit_interaction).grid(row=2, column=2)
+        self.pet_step_var = tk.StringVar(value="1")
+        ttk.Label(pet, text="Nudge (preview px):").grid(row=3, column=0, columnspan=2)
+        ttk.Entry(pet, textvariable=self.pet_step_var, width=6).grid(row=3, column=2)
+        nudges = ttk.Frame(pet)
+        nudges.grid(row=4, column=0, columnspan=4, sticky="w")
+        for label, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
+            ttk.Button(nudges, text=label, width=5,
+                       command=lambda dx=dx, dy=dy: self._nudge_pet(dx, dy)).pack(side="left")
+        ttk.Button(nudges, text="Reset", width=6, command=self._reset_pet_position).pack(side="left")
+        self.pet_hint = ttk.Label(pet, wraplength=295)
+        self.pet_hint.grid(row=5, column=0, columnspan=4, sticky="w")
+        self.pet_controls = [widget for parent in (pet, nudges) for widget in parent.winfo_children()
+                             if isinstance(widget, (ttk.Button, ttk.Checkbutton, ttk.Entry))]
+        self._refresh_pedestrians()
+
+    def _toggle_pet(self):
+        if self._pedestrian() is None:
+            self.pet_enabled_var.set(False)
+            messagebox.showinfo("Dog interaction", "Select a custom pedestrian first.", parent=self.root)
+            return
+        self._change_pedestrian(pet_dog=self.pet_enabled_var.get())
+
+    def _set_pet_duration(self, _event=None):
+        try:
+            seconds = float(self.pet_duration_var.get())
+            if not math.isfinite(seconds) or seconds <= 0:
+                raise ValueError("Enter a positive, finite petting duration.")
+        except ValueError as error:
+            messagebox.showerror("Invalid petting duration", str(error), parent=self.root)
+            return
+        self._change_pedestrian(pet_seconds=seconds)
+
+    def _selected_interaction(self):
+        spec = self._pedestrian()
+        if spec is None or not spec.pet_dog:
+            return None
+        return interaction_for(self.read_params())
+
+    def _fit_interaction(self):
+        interaction = self._selected_interaction()
+        if interaction is not None:
+            self.vars["anim_cycles"].set(max(self.p.anim_cycles, math.ceil((interaction.end + 1) / 12)))
+            self.schedule()
+
+    def _position_pet(self):
+        if self._positioning_pet:
+            self._positioning_pet = False
+            self._pet_drag = None
+        else:
+            interaction = self._selected_interaction()
+            if interaction is None:
+                messagebox.showinfo("Position petting pose", "Enable the dog interaction first.", parent=self.root)
+                return
+            if interaction.pet_start >= self._timeline_frames():
+                if not messagebox.askyesno("Petting outside shot", "Fit the sequence to show the petting pose?",
+                                          parent=self.root):
+                    return
+                self._fit_interaction()
+            if self._pedestrian().walk_duration is None:
+                self._change_pedestrian(walk_duration=interaction.duration)
+            self._route_draft = None
+            self._positioning_pet = True
+            self._scrub_to(interaction.pet_start)
+        self._refresh_pedestrians()
+        self.schedule()
+
+    def _move_pet_pixels(self, dx, dy):
+        interaction = self._selected_interaction()
+        cam = self._preview_cam
+        if interaction is None or cam is None:
+            messagebox.showerror("Position unavailable", "Wait for a dog-interaction preview.", parent=self.root)
+            return
+        sx, sy = cam.project(cam.to_cam(*interaction.stop))
+        target = cam.ground_point(sx + dx / self._preview_scale, sy + dy / self._preview_scale)
+        if target is None or not all(math.isfinite(v) for v in target):
+            messagebox.showerror("Invalid position", "That position is outside the visible ground.", parent=self.root)
+            return
+        spec = self._pedestrian()
+        offset = tuple(spec.pet_offset[i] + target[i] - interaction.stop[i] for i in (0, 1))
+        self._change_pedestrian(pet_offset=offset)
+        if self._positioning_pet:
+            updated = self._selected_interaction()
+            self._scrub_to(updated.pet_start)
+
+    def _drag_pet_position(self, event):
+        if self._pet_drag is not None and not self._rendering and self._positioning_pet:
+            x, y = self._pet_drag
+            self._move_pet_pixels(event.x - x, event.y - y)
+            self._pet_drag = event.x, event.y
+
+    def _nudge_pet(self, dx, dy):
+        if not self._positioning_pet:
+            self._position_pet()
+        if not self._positioning_pet:
+            return
+        try:
+            step = float(self.pet_step_var.get())
+            if not math.isfinite(step) or step <= 0:
+                raise ValueError("Nudge size must be a positive number.")
+        except ValueError as error:
+            messagebox.showerror("Invalid nudge size", str(error), parent=self.root)
+            return
+        self._move_pet_pixels(dx * step, dy * step)
+
+    def _reset_pet_position(self):
+        self._change_pedestrian(pet_offset=(0.0, 0.0))
+        if self._positioning_pet:
+            self._scrub_to(self._selected_interaction().pet_start)
+
+    def _pedestrian(self):
+        return next((p for p in self.p.custom_pedestrians if p.id == self._pedestrian_id), None)
+
+    def _refresh_pedestrians(self, clip_selection=None):
+        spec = self._pedestrian()
+        self.pedestrian_list.delete(0, "end")
+        for i, person in enumerate(self.p.custom_pedestrians):
+            kind = "Imported" if person.side_walk_folder is not None else "Pedestrian"
+            suffix = " (in place)" if len(person.route) == 1 else "" if person.route else " (not placed)"
+            self.pedestrian_list.insert("end", f"{kind} {i + 1}{suffix}")
+            if person is spec:
+                self.pedestrian_list.selection_set(i)
+                self.pedestrian_list.see(i)
+        for button in self.pedestrian_buttons:
+            button.config(state="normal" if spec else "disabled")
+        imported = spec is not None and spec.side_walk_folder is not None
+        for button in (*self.builtin_look_buttons, *self.clip_buttons, *self.pet_controls):
+            button.configure(state="normal" if spec and not imported else "disabled")
+        for button in self.side_buttons:
+            button.configure(state="normal" if imported else "disabled")
+        if imported and len(spec.route) == 1:
+            self.speed_button.configure(state="disabled")
+            self.side_buttons[1].configure(state="disabled")
+        self.hair_variant.set(spec.female if spec else False)
+        self.pet_enabled_var.set(spec.pet_dog if spec else False)
+        self.pet_duration_var.set(f"{spec.pet_seconds:g}" if spec else "2")
+        self.pet_position_button.configure(text="Done positioning" if self._positioning_pet
+                                           else "Position petting pose")
+        for i, button in enumerate(self.part_buttons):
+            self._fix_btn_fg(button, spec.colors[i] if spec else "#dddddd")
+        self._refresh_timeline_settings(clip_selection=clip_selection)
+        self._draw_route_overlay()
+
+    def _refresh_route_hint(self):
+        spec = self._pedestrian()
+        if self._route_draft is None:
+            self.route_controls.grid_remove()
+            speed = (interaction_for(self.p, validate=False).speed if spec and spec.pet_dog
+                     else spec.walk_speed(self.p.anim_fps) if spec else 0)
+            stationary = spec is not None and spec.side_walk_folder is not None and len(spec.route) == 1
+            text = (("" if stationary else f"Speed: {speed:.3g} units/sec. ")
+                    + f"Size: {spec.height or self.p.person_size:g} units. "
+                    + (f"Animation: {Path(spec.side_walk_folder).name}. "
+                       + ("" if stationary else f"Stride: {spec.side_walk_stride:g} heights. ")
+                       + ("[missing: relink] " if not Path(spec.side_walk_folder).is_dir() else "")
+                       if spec.side_walk_folder is not None else "")
+                    + ("Animating in place." if stationary else
+                       f"Route: {len(spec.route)} points." if spec.route else
+                       "Draw a route or place this imported character." if spec.side_walk_folder is not None else
+                       "Draw a route to place this pedestrian.")
+                    if spec else "No custom pedestrian selected. Use Add pedestrian to start.")
+        else:
+            self.route_controls.grid()
+            text = ("Click the start on the preview." if not self._route_draft else
+                    "Click more points for a route, or Finish route to animate in place."
+                    if spec and spec.side_walk_folder is not None and len(self._route_draft) == 1 else
+                    "Click waypoints and the stop on the preview, then Finish route.")
+        self.pedestrian_hint.set(text)
+
+    def _select_pedestrian(self, _event):
+        selected = self.pedestrian_list.curselection()
+        if not selected or self._rendering:
+            return
+        pid = self.p.custom_pedestrians[selected[0]].id
+        if pid != self._pedestrian_id:
+            was_positioning = self._positioning_pet
+            self._pedestrian_id = pid
+            self._route_draft = None
+            self._positioning_pet = False
+            self._pet_drag = None
+            self._timeline_notice = ""
+            self._refresh_pedestrians()
+            if was_positioning:
+                self.schedule()
+
+    def _add_pedestrian(self):
+        self._positioning_pet = False
+        self._pet_drag = None
+        spec = crowd.CustomPedestrian(uuid.uuid4().hex)
+        self._pedestrian_id = spec.id
+        self.p.custom_pedestrians += (spec,)
+        self._route_draft = None
+        self._refresh_pedestrians()
+        self.schedule()
+
+    def _choose_side_walk(self):
+        folder = filedialog.askdirectory(parent=self.root, title="Choose numbered PNG walk-cycle folder")
+        if not folder:
+            return None
+        folder = str(Path(folder).resolve())
+        try:
+            crowd.load_side_walk.cache_clear()
+            crowd.load_side_walk(folder)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Invalid walk cycle", str(error), parent=self.root)
+            return None
+        self._pending_cache_clear = True
+        return folder
+
+    def _add_side_pedestrian(self):
+        folder = self._choose_side_walk()
+        if folder is not None:
+            self._add_pedestrian()
+            self._change_pedestrian(side_walk_folder=folder)
+
+    def _relink_side_walk(self):
+        spec = self._pedestrian()
+        if spec is not None and spec.side_walk_folder is not None:
+            folder = self._choose_side_walk()
+            if folder is not None:
+                self._change_pedestrian(side_walk_folder=folder)
+
+    def _set_side_stride(self):
+        spec = self._pedestrian()
+        if spec is not None and spec.side_walk_folder is not None:
+            stride = simpledialog.askfloat(
+                "Walk-cycle stride", "Distance per cycle, in pedestrian heights:",
+                parent=self.root, initialvalue=spec.side_walk_stride, minvalue=0.01)
+            if stride is not None:
+                if not math.isfinite(stride) or stride <= 0:
+                    messagebox.showerror("Invalid stride", "Enter a positive, finite stride.", parent=self.root)
+                else:
+                    self._change_pedestrian(side_walk_stride=stride)
+
+    def _remove_pedestrian(self):
+        self._positioning_pet = False
+        self._pet_drag = None
+        self.p.custom_pedestrians = tuple(p for p in self.p.custom_pedestrians if p.id != self._pedestrian_id)
+        self._pedestrian_id = None
+        self._route_draft = None
+        self._refresh_pedestrians()
+        self.schedule()
+
+    def _change_pedestrian(self, *, clip_selection=None, **changes):
+        spec = self._pedestrian()
+        if spec is not None:
+            pedestrians = tuple(replace(p, **changes) if p is spec else p
+                                for p in self.p.custom_pedestrians)
+            try:
+                params = replace(self.read_params(), custom_pedestrians=pedestrians)
+                validate_project_params(params)
+            except ValueError as error:
+                messagebox.showerror("Invalid pedestrian settings", str(error), parent=self.root)
+                self._refresh_pedestrians()
+                return
+            self.p.custom_pedestrians = pedestrians
+            if not self._pedestrian().pet_dog:
+                self._positioning_pet = False
+                self._pet_drag = None
+            self._refresh_pedestrians(clip_selection)
+            self.schedule()
+
+    def _pick_part(self, index):
+        spec = self._pedestrian()
+        if spec is not None:
+            _, color = colorchooser.askcolor(spec.colors[index], parent=self.root)
+            if color:
+                self._change_pedestrian(colors=spec.colors[:index] + (color,) + spec.colors[index + 1:])
+
+    def _set_pedestrian_speed(self):
+        spec = self._pedestrian()
+        if spec is not None:
+            interaction = self._selected_interaction()
+            speed = simpledialog.askfloat("Walking speed", "World units per second (snaps to whole frames):",
+                                          parent=self.root,
+                                          initialvalue=interaction.speed if interaction else spec.walk_speed(self.p.anim_fps),
+                                          minvalue=0.01, maxvalue=100)
+            if speed is not None and math.isfinite(speed):
+                length = interaction.distances[-1] if interaction else spec.route_length()
+                duration = max(2, math.ceil(length * self.p.anim_fps / speed) + 1)
+                self._change_pedestrian(speed=speed, walk_duration=duration if spec.route else None)
+
+    def _set_pedestrian_size(self):
+        spec = self._pedestrian()
+        if spec is not None:
+            current_height = spec.height or self.read_params().person_size
+            height = simpledialog.askfloat("Pedestrian size", "Height in world units:",
+                                           parent=self.root, initialvalue=current_height,
+                                           minvalue=MIN_PERSON_SIZE, maxvalue=MAX_PERSON_SIZE)
+            if height is not None:
+                if not math.isfinite(height):
+                    messagebox.showerror("Invalid pedestrian size", "Enter a finite height.", parent=self.root)
+                    return
+                self._change_pedestrian(height=height)
+
+    def _pedestrian_tab_active(self):
+        return self.notebook.select() == str(self.pedestrian_tab)
+
+    def _pedestrian_tab_changed(self, _event):
+        if self._pedestrian_tab_active():
+            self.read_params()
+            self._refresh_route_hint()
+        self._draw_route_overlay()
+        if not self.vars["animate_preview"].get():
+            self.schedule()
+
+    def _start_route(self):
+        if self._pedestrian() is not None:
+            was_positioning = self._positioning_pet
+            self._positioning_pet = False
+            self._route_draft = []
+            self._refresh_route_hint()
+            self._draw_route_overlay()
+            if was_positioning:
+                self.schedule()
+
+    def _place_route_point(self, event):
+        if self._positioning_pet and not self._rendering and self._pedestrian_tab_active():
+            self._pet_drag = event.x, event.y
+            return
+        if self._rendering or self._route_draft is None or not self._pedestrian_tab_active():
+            return
+        if self._preview_scale != 1.0:
+            self.pedestrian_hint.set("Wait for the full shot preview before drawing a route.")
+            return
+        cam, bounds = self._preview_cam, self._preview_bounds
+        if cam is None or bounds is None:
+            self.pedestrian_hint.set("Wait for the shot preview before clicking.")
+            return
+        x0, y0, x1, y1 = bounds
+        point = (cam.ground_point(event.x - x0, event.y - y0)
+                 if x0 <= event.x < x1 and y0 <= event.y < y1 else None)
+        if point is None or (self._route_draft and math.dist(self._route_draft[-1], point) < 1e-8):
+            self.pedestrian_hint.set("Click a different point on the visible ground inside the shot.")
+            return
+        self._route_draft.append(point)
+        self._refresh_route_hint()
+        self._draw_route_overlay()
+
+    def _undo_route_point(self):
+        if self._route_draft:
+            self._route_draft.pop()
+            self._refresh_route_hint()
+            self._draw_route_overlay()
+
+    def _cancel_route(self):
+        self._route_draft = None
+        self._refresh_route_hint()
+        self._draw_route_overlay()
+
+    def _finish_route(self):
+        spec = self._pedestrian()
+        minimum = 1 if spec is not None and spec.side_walk_folder is not None else 2
+        if self._route_draft is None or len(self._route_draft) < minimum:
+            self.pedestrian_hint.set("Click a position on the preview." if minimum == 1 else
+                                     "Place at least a start and a stop.")
+            return
+        route = tuple(self._route_draft)
+        self._route_draft = None
+        if spec is not None:
+            duration = spec.walk_duration
+            if len(route) == 1:
+                duration = None
+            elif len(spec.route) < 2:
+                duration = replace(spec, route=route).walk_end(self.p.anim_fps) - spec.departure + 1
+            self._change_pedestrian(route=route, walk_duration=duration)
+
+    def _draw_route_overlay(self):
+        self.canvas.delete("route")
+        if self._positioning_pet or self._preview_scale != 1.0:
+            return
+        cam, bounds = self._preview_cam, self._preview_bounds
+        spec = self._pedestrian()
+        if cam is None or bounds is None or not self._pedestrian_tab_active() or spec is None:
+            return
+        editing = self._route_draft is not None
+        route = self._route_draft if editing else spec.route
+        if not editing and spec.pet_dog:
+            route = interaction_for(self.p, validate=False).route
+        previous = None
+        for i, (x, y) in enumerate(route):
+            point = cam.to_cam(x, y)
+            if point[2] <= cam.near:
+                previous = None
+                continue
+            sx, sy = cam.project(point)
+            position = (sx + bounds[0], sy + bounds[1])
+            if previous is not None:
+                self.canvas.create_line(*previous, *position, fill="#ffdb6c", width=2, tags="route")
+            previous = position
+            if 0 <= sx < cam.w and 0 <= sy < cam.h:
+                px, py = position
+                self.canvas.create_oval(px - 4, py - 4, px + 4, py + 4,
+                                        fill="#ffdb6c", outline="#222", tags="route")
+                label = ("Position" if not editing and len(route) == 1 else
+                         "Start" if i == 0 else "Stop" if not editing and i == len(route) - 1 else str(i))
+                self.canvas.create_text(px, py - 7, text=label, anchor="s", fill="#ffdb6c", tags="route")
+
+    def _timeline_frames(self):
+        return self.p.anim_cycles * crowd.FRAME_COUNT
+
+    def _refresh_timeline_settings(self, *_args, clip_selection=None):
+        if not self._loading:
+            self._read_animation_settings(self.p)
+        self._scrub_frame = min(self._scrub_frame, self._timeline_frames() - 1)
+        if clip_selection is None:
+            clip_selection = next(iter(self.clip_list.curselection()), None)
+        self.clip_list.delete(0, "end")
+        spec = self._pedestrian()
+        if spec:
+            for block in spec.clips:
+                warning = (" [outside shot]" if block.end >= self._timeline_frames() else "")
+                if not Path(block.folder).is_dir():
+                    warning += " [missing: relink]"
+                self.clip_list.insert("end", f"{block.start + 1}–{block.end + 1}: {Path(block.folder).name}{warning}")
+            if clip_selection is not None and clip_selection < len(spec.clips):
+                self.clip_list.selection_set(clip_selection)
+        self._refresh_route_hint()
+        if spec and spec.pet_dog:
+            interaction = interaction_for(self.p, validate=False)
+            warning = " [cut off: use Fit sequence]" if interaction.end >= self._timeline_frames() else ""
+            self.pet_hint.configure(text=(
+                f"Pet {interaction.pet_start + 1}-{interaction.return_start}. "
+                f"Dog exits by frame {interaction.end + 1}.{warning}\n"
+                + ("Drag preview to position; Done to finish. " if self._positioning_pet else "")
+                + f"Offset: {spec.pet_offset[0]:.3f}, {spec.pet_offset[1]:.3f} world units."))
+        else:
+            self.pet_hint.configure(text="One pedestrian per shot. Draw a route and enable Show dog.")
+        self._draw_timeline()
+
+    def _timeline_span(self):
+        return max(1, self.timeline.winfo_width() - self.TIMELINE_LEFT - 8)
+
+    def _timeline_x(self, boundary):
+        return self.TIMELINE_LEFT + self._timeline_span() * boundary / self._timeline_frames()
+
+    def _timeline_blocks(self, spec):
+        if spec is not None:
+            if len(spec.route) >= 2:
+                end = (interaction_for(self.p, validate=False).pet_start if spec.pet_dog
+                       else spec.walk_end(self.p.anim_fps))
+                yield "walk", None, spec.departure, end, "Approach" if spec.pet_dog else "Walk"
+            for index, block in enumerate(spec.clips):
+                yield "clip", index, block.start, block.end, Path(block.folder).name
+
+    def _draw_timeline(self, frame=None):
+        frame = self._scrub_frame if frame is None else frame
+        size = self._timeline_frames()
+        frame = min(frame, size - 1)
+        canvas = self.timeline
+        canvas.delete("all")
+        for title, y in (("Scrub", 12), ("Walk", 34), ("Animation", 60)):
+            canvas.create_text(4, y, text=title, fill="#ddd", anchor="w")
+        left, right = self._timeline_x(0), self._timeline_x(size)
+        canvas.create_line(left, 12, right, 12, fill="#999")
+        for y0, y1 in self.TIMELINE_LANES.values():
+            canvas.create_rectangle(left, y0, right, y1, fill="#383838", outline="")
+        spec = self._pedestrian()
+        label = f"Frame {frame + 1}/{size}"
+        drag = self._block_drag
+        for lane, index, start, end, name in self._timeline_blocks(spec):
+            dragged = drag is not None and (lane, index) == (drag["lane"], drag["index"])
+            if dragged:
+                start, end = drag["range"]
+            if lane == "walk":
+                label += f"  |  Walk {start + 1}–{end + 1}"
+                if end >= size:
+                    label += " (outside)"
+            x0, x1 = max(left, self._timeline_x(start)), min(right, self._timeline_x(end + 1))
+            if x1 <= x0:
+                continue
+            y0, y1 = self.TIMELINE_LANES[lane]
+            color = ("#d98278" if dragged and drag["error"] else
+                     "#80c795" if lane == "walk" else "#8ab4e9")
+            canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#1c1c1c")
+            if x1 - x0 >= 10:
+                for x in (x0 + 2, x1 - 2):
+                    canvas.create_line(x, y0 + 5, x, y1 - 5, fill="#344454")
+            if x1 - x0 >= 28:
+                chars = max(1, int((x1 - x0 - 12) / 8))
+                canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, fill="#151515", text=name[:chars])
+        if spec is not None and spec.pet_dog:
+            interaction = interaction_for(self.p, validate=False)
+            for start, end, title, lane in (
+                    (interaction.pet_start, interaction.return_start, "Pet", "clip"),
+                    (interaction.return_start, interaction.end + 1, "Return + dog", "walk")):
+                x0, x1 = max(left, self._timeline_x(start)), min(right, self._timeline_x(end))
+                if x1 > x0:
+                    y0, y1 = self.TIMELINE_LANES[lane]
+                    canvas.create_rectangle(x0, y0, x1, y1, fill="#d4b37c", outline="")
+                    canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=title, fill="#151515")
+        playhead = self._timeline_x(frame + .5)
+        canvas.create_line(playhead, 3, playhead, 72, fill="white")
+        self.timeline_label.config(text=label)
+        self.timeline_help.config(text=(drag["error"] if drag else "") or self._timeline_notice
+                                  or ("The imported animation repeats throughout the shot."
+                                      if spec and spec.side_walk_folder is not None and len(spec.route) == 1 else "")
+                                  or "Drag a block to move it. Drag either edge to resize.")
+
+    def _scrub_timeline(self, event):
+        if self._rendering:
+            return
+        size = self._timeline_frames()
+        self._scrub_to(max(0, min(size - 1, int((event.x - self.TIMELINE_LEFT)
+                                               * size / self._timeline_span()))))
+
+    def _timeline_hit(self, event):
+        size = self._timeline_frames()
+        for lane, index, start, end, _ in self._timeline_blocks(self._pedestrian()):
+            y0, y1 = self.TIMELINE_LANES[lane]
+            x0, x1 = self._timeline_x(start), self._timeline_x(min(end + 1, size))
+            if y0 <= event.y <= y1 and x0 <= event.x < x1:
+                edge = min(7, (x1 - x0) / 3)
+                mode = "start" if event.x - x0 < edge else "end" if x1 - event.x <= edge else "move"
+                return lane, index, start, end, mode
+        return None
+
+    def _timeline_hover(self, event):
+        hit = self._timeline_hit(event)
+        cursor = ("fleur" if hit[-1] == "move" else "sb_h_double_arrow") if hit else ""
+        self.timeline.configure(cursor=cursor)
+
+    def _timeline_press(self, event):
+        if self._rendering:
+            return
+        self._timeline_notice = ""
+        hit = self._timeline_hit(event)
+        self._timeline_scrubbing = hit is None and event.y < self.TIMELINE_LANES["walk"][0]
+        if hit:
+            lane, index, start, end, mode = hit
+            if self.vars["animate_preview"].get():
+                self._scrub_to(self._preview_frame)
+            if index is not None:
+                self.clip_list.selection_clear(0, "end")
+                self.clip_list.selection_set(index)
+                self.clip_list.see(index)
+            self._block_drag = dict(lane=lane, index=index, start=start, end=end, mode=mode,
+                                    x=event.x, range=(start, end), error="")
+            self._draw_timeline()
+        elif self._timeline_scrubbing:
+            self._scrub_timeline(event)
+
+    def _timeline_drag(self, event):
+        if self._rendering:
+            return
+        if self._timeline_scrubbing:
+            self._scrub_timeline(event)
+        drag = self._block_drag
+        if drag is None:
+            return
+        size = self._timeline_frames()
+        start, end = drag["start"], drag["end"]
+        delta = round((event.x - drag["x"]) * size / self._timeline_span())
+        mode = drag["mode"]
+        if mode in ("start", "move"):
+            start += delta
+        if mode == "move":
+            end += delta
+        elif mode == "end" and delta:
+            end = min(end, size - 1) + delta
+        error = ""
+        spec = self._pedestrian()
+        if (start, end) != (drag["start"], drag["end"]) and spec is not None:
+            minimum = 2 if drag["lane"] == "walk" else 1
+            if start < 0 or end >= size:
+                error = "Keep the block inside the shot."
+            elif end - start + 1 < minimum:
+                error = f"This block needs at least {minimum} frame(s)."
+            elif drag["lane"] == "clip" and any(
+                    i != drag["index"] and start <= block.end and block.start <= end
+                    for i, block in enumerate(spec.clips)):
+                error = "Animation clips on the same lane cannot overlap."
+        drag.update(range=(start, end), error=error)
+        self._draw_timeline()
+
+    def _timeline_release(self, event):
+        self._timeline_scrubbing = False
+        if self._block_drag is None:
+            return
+        self._timeline_drag(event)
+        drag, self._block_drag = self._block_drag, None
+        self._timeline_notice = drag["error"]
+        start, end = drag["range"]
+        spec = self._pedestrian()
+        if (self._rendering or spec is None or drag["error"]
+                or (start, end) == (drag["start"], drag["end"])):
+            self._draw_timeline()
+            return
+        if drag["lane"] == "walk":
+            duration = spec.walk_duration if drag["mode"] == "move" else end - start + 1
+            self._change_pedestrian(departure=start, walk_duration=duration)
+        else:
+            blocks = list(spec.clips)
+            index = drag["index"]
+            block = blocks[index] = replace(blocks[index], start=start, end=end)
+            blocks.sort(key=lambda clip: clip.start)
+            self._change_pedestrian(clips=tuple(blocks), clip_selection=blocks.index(block))
+
+    def _go_to_frame(self):
+        size = self._timeline_frames()
+        frame = simpledialog.askinteger("Go to frame", f"Frame (1–{size}):", parent=self.root,
+                                        initialvalue=self._scrub_frame + 1, minvalue=1, maxvalue=size)
+        if frame is not None:
+            self._scrub_to(frame - 1)
+
+    def _scrub_to(self, frame):
+        self.vars["animate_preview"].set(False)
+        self._toggle_anim_preview_stop()
+        self._scrub_frame = frame
+        self._draw_timeline()
+        self.schedule()
+
+    def _change_clip(self, index):
+        spec = self._pedestrian()
+        if spec is None:
+            return
+        blocks = list(spec.clips)
+        block = (blocks.pop(index) if index is not None else
+                 crowd.ClipBlock("", self._scrub_frame, self._scrub_frame))
+        folders = tuple(animation_folders(self.p))
+        result = ClipDialog(self.root, folders, block, self._timeline_frames(), blocks).result
+        if result is not None:
+            blocks.append(result)
+            blocks.sort(key=lambda clip: clip.start)
+            self._change_pedestrian(clips=tuple(blocks), clip_selection=blocks.index(result))
+
+    def _add_clip(self):
+        self._change_clip(None)
+
+    def _edit_clip(self):
+        selected = self.clip_list.curselection()
+        if selected:
+            self._change_clip(selected[0])
+
+    def _remove_clip(self):
+        spec, selected = self._pedestrian(), self.clip_list.curselection()
+        if spec is not None and selected:
+            i = selected[0]
+            self._change_pedestrian(clips=spec.clips[:i] + spec.clips[i + 1:])
+
     def _build_crowd_tab(self, tab):
         r = 0
         ev = tk.BooleanVar(value=self.p.crowd_enabled)
@@ -1758,12 +2828,20 @@ class App:
 
         sliders = [
             ("crowd_count", "People", 0, 100, int),
-            ("person_size", "Person size (world units)", 0.5, 4, float),
+            ("person_size", "Person size (world units)", MIN_PERSON_SIZE, MAX_PERSON_SIZE, float),
             ("size_var", "Size variation (±)", 0, 0.4, float),
             ("crowd_speed", "Walk speed", 0.25, 3, float),
         ]
         for key, label, lo, hi, typ in sliders:
             r = self._slider(tab, r, key, label, lo, hi, typ)
+
+        looping = tk.BooleanVar(value=self.p.loop_pedestrians)
+        self.vars["loop_pedestrians"] = looping
+        ttk.Checkbutton(
+            tab, text="Loop pedestrians",
+            variable=looping, command=self.schedule,
+        ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        r += 1
 
         seed_f = ttk.Frame(tab)
         seed_f.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0)); r += 1
@@ -1783,7 +2861,7 @@ class App:
         ttk.Label(anim_f, text="Cycles").pack(side="left")
         cv = tk.IntVar(value=self.p.anim_cycles)
         self.vars["anim_cycles"] = cv
-        ttk.Spinbox(anim_f, from_=1, to=40, width=4, textvariable=cv).pack(side="left", padx=4)
+        ttk.Spinbox(anim_f, from_=1, to=500, width=4, textvariable=cv).pack(side="left", padx=4)
         ttk.Label(tab, text="(12 frames per walk cycle)", foreground="#666").grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
 
         self._animate_checkbox(tab, r)
@@ -1798,6 +2876,10 @@ class App:
         ev = tk.BooleanVar(value=self.p.dog_enabled)
         self.vars["dog_enabled"] = ev
         ttk.Checkbutton(tab, text="Show dog (image center)", variable=ev, command=self.schedule).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 6)); r += 1
+        blink = tk.BooleanVar(value=self.p.dog_blink)
+        self.vars["dog_blink"] = blink
+        ttk.Checkbutton(tab, text="Dog blinks occasionally", variable=blink,
+                        command=self.schedule).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 6)); r += 1
         sliders = [
             ("dog_size", "Dog size (world units)", 0.2, 3, float),
             ("dog_clearance", "People keep away (radius)", 0, 3, float),
@@ -1845,21 +2927,29 @@ class App:
         except (tk.TclError, ValueError):
             pass
         p.mode = self.vars["mode"].get()
-        for key in ("angle", "zoom", "tilt", "stripe_width", "stripe_gap", "depth",
+        for key in ("angle", "zoom", "tilt", "camera_shift", "stripe_width", "stripe_gap", "depth",
                     "stripe_wobble", "background_zoom"):
             setattr(p, key, float(self.vars[key].get()))
+        p.background_animated = bool(self.vars["background_animated"].get())
+        p.stripes_animated = bool(self.vars["stripes_animated"].get())
         p.background_perspective = bool(self.vars["background_perspective"].get())
         p.stripe_count = int(round(self.vars["stripe_count"].get()))
         p.crowd_enabled = bool(self.vars["crowd_enabled"].get())
+        p.loop_pedestrians = bool(self.vars["loop_pedestrians"].get())
         p.shadows_enabled = bool(self.vars["shadows_enabled"].get())
         p.shadow_style = self.vars["shadow_style"].get()
         p.crowd_count = int(round(self.vars["crowd_count"].get()))
         for key in ("person_size", "size_var", "crowd_speed"):
             setattr(p, key, float(self.vars[key].get()))
         p.dog_enabled = bool(self.vars["dog_enabled"].get())
+        p.dog_blink = bool(self.vars["dog_blink"].get())
         for key in ("dog_size", "dog_clearance", "dog_tilt"):
             setattr(p, key, float(self.vars[key].get()))
         p.dog_hold = max(1, int(round(self.vars["dog_hold"].get())))
+        self._read_animation_settings(p)
+        return p
+
+    def _read_animation_settings(self, p):
         for key in ("crowd_seed", "anim_fps", "anim_cycles"):
             try:
                 setattr(p, key, max(0, int(self.vars[key].get())))
@@ -1867,17 +2957,6 @@ class App:
                 pass
         p.anim_fps = max(1, p.anim_fps)
         p.anim_cycles = max(1, p.anim_cycles)
-        return p
-
-    def _get_people(self, p, cam, dog):
-        routes = walk_routes(p)
-        obstacle = dog.obstacle() if dog else None
-        key = (p.crowd_count, p.person_size, p.size_var, p.crowd_speed,
-               p.crowd_seed, p.angle, p.tilt, p.zoom, cam.w, cam.h, obstacle, routes)
-        if key != self._people_key:
-            self._people = crowd.make_crowd(p, routes, cam, obstacle)
-            self._people_key = key
-        return self._people
 
     def schedule(self):
         if self._rendering:
@@ -1895,14 +2974,19 @@ class App:
         if self._rendering:
             return
         p = replace(self.read_params())
-        frame = self._anim_t if self.vars["animate_preview"].get() else 0
+        frame = (self._anim_t if self.vars["animate_preview"].get()
+                 else self._scrub_frame if self._pedestrian_tab_active() else 0)
+        if p.custom_pedestrians or self._pedestrian_tab_active():
+            frame = min(frame, self._timeline_frames() - 1)
         cw = max(50, self.canvas.winfo_width())
         ch = max(50, self.canvas.winfo_height())
         s = min(cw / p.width, ch / p.height, 1.0)
         pw, ph = max(1, int(p.width * s)), max(1, int(p.height * s))
         self._preview_revision += 1
+        preview = (_pet_preview_images if self._positioning_pet and self._pedestrian_tab_active()
+                   else _preview_images)
         self._pending_preview = (
-            "preview", partial(_background_call, _preview_images, (p, pw, ph, frame)),
+            "preview", partial(_background_call, preview, (p, pw, ph, frame)),
             (self._preview_revision, p, pw, ph, frame, cw, ch))
         self._ensure_worker_poll()
 
@@ -1920,24 +3004,22 @@ class App:
         return p.crowd_enabled and p.crowd_count > 0
 
     def _compose_crowd(self, bg: Image.Image, p: Params, cam: Camera, frame: int) -> Image.Image:
-        crowd_on = self._crowd_on(p)
-        if not (crowd_on or p.dog_enabled):
-            return bg
-        img = bg.copy()
-        dog = make_dog(p)
-        people = self._get_people(p, cam, dog) if crowd_on else []
-        crowd.draw_frame(img, cam, people, frame, dog, shadows=p.shadows_enabled,
-                         shadow_style=p.shadow_style, shadow_hold=p.dog_hold)
-        return img
+        return ShotRenderer(p, cam.w, cam.h).compose(bg, frame)
 
     def _toggle_anim_preview(self):
         if self.vars["animate_preview"].get():
             if self._anim_job is None:
+                if self._pedestrian_tab_active():
+                    self._anim_t = self._scrub_frame
+                    self.update_preview()
                 self._anim_tick()
         else:
             if self._anim_job is not None:
                 self.root.after_cancel(self._anim_job)
                 self._anim_job = None
+            if self._pedestrian_tab_active():
+                self._scrub_frame = min(self._preview_frame, self._timeline_frames() - 1)
+                self._draw_timeline()
             self._anim_t = 0
             if self._job is not None:
                 self.root.after_cancel(self._job)
@@ -1952,6 +3034,10 @@ class App:
         if (not self._rendering and self._job is None and self._future is None
                 and self._pending_preview is None):
             self._anim_t += 1
+            if p.custom_pedestrians or self._pedestrian_tab_active():
+                self._anim_t %= self._timeline_frames()
+                self._scrub_frame = self._anim_t
+                self._draw_timeline()
             self.update_preview()
             delay = max(1, round(1000 / p.anim_fps))
         self._anim_job = self.root.after(delay, self._anim_tick)
@@ -1965,6 +3051,7 @@ class App:
             return
         self.root.config(cursor="watch"); self.root.update()
         try:
+            validate_animation_folders(p)
             bg = render(p, frame=frame)
             self._compose_crowd(bg, p, Camera(p, p.width, p.height), frame).save(path)
             self.status.config(text=f"Saved {path}")
@@ -1977,8 +3064,10 @@ class App:
         if self._rendering:
             return
         p = replace(self.read_params())
-        if not (self._crowd_on(p) or p.dog_enabled or p.stripe_wobble > 0 or len(p.background_images) > 1):
-            messagebox.showinfo("Nothing to animate", "Choose multiple backgrounds, increase wobble, or enable the crowd or dog.")
+        if not (self._crowd_on(p) or any(spec.route for spec in p.custom_pedestrians) or p.dog_enabled or
+                (p.stripe_wobble > 0 and (p.background_animated or p.stripes_animated)) or
+                (p.background_animated and len(p.background_images) > 1)):
+            messagebox.showinfo("Nothing to animate", "Place a custom pedestrian, enable the crowd or dog, or animate the background or stripes.")
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".gif", filetypes=[("GIF preview + PNG frames", "*.gif")],

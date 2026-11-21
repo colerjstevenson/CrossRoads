@@ -37,10 +37,23 @@ render assets unless asked.
     Preserve frame-zero route bounds, RNG consumption, and exact sprite pixels.
   - `WalkRoute`, `Obstacle`, and `Person` represent routes, avoidance, and
     walker motion.
+  - `DogInteraction` resolves the optional custom-pedestrian approach, pet,
+    reversed return, and distance-based dog following. Its ground offset
+    changes the real stop; all render paths share the same choreography.
+    `InteractionObstacles` caches deterministic passing sides from frame zero
+    to prevent crowd walkers jumping across moving actors when scrubbing.
+    Ordinary shots retain the original seeded crowd and obstacle path.
+  - Built-in `petting` layers have a male-hair-only fallback and use standing
+    body scale, not a crop enlarged to standing height. Generic imported clips
+    still require both hair variants.
 - `dog.py`
   - Loads and caches dog cycles from `Animations/dog_forward/` and
     `Animations/dog_backward/`.
   - `Dog` provides the center obstacle and a gaze-directed animated sprite.
+    During an interaction, scene composition uses the dog's resolved position.
+    `load_interaction_assets` composites `dog_excited` overlays from
+    `dog_backwards_blink` on the source canvas and loads `dog_walk` separately,
+    preserving sitting-body scale and paw registration.
 - `BG.png` is the default road texture, loaded relative to
   `crosswalk_generator.py`. Users can select other images in the Crosswalk tab.
   Do not assume the current working directory is the asset root.
@@ -81,6 +94,12 @@ render assets unless asked.
 - Editor changes do not mutate saved shots; only explicit Update shot does.
   Edit/drag targets use shot IDs, not positional indices. Project save keeps
   uncommitted editor settings separate from shot settings.
+- One optional dog interaction is allowed per shot. Petting duration and finite
+  ground-position offsets persist with each custom pedestrian. Preview drag
+  and nudge controls project screen deltas onto the ground, leaving authored
+  route waypoints unchanged. Positioning pins the Approach duration; generated
+  phases follow it. Fit sequence explicitly rounds completion up to 12 frames.
+  Clips cannot overlap the reserved petting interval, and the dog must be shown.
 
 ## Development and verification
 
